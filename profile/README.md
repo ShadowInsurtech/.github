@@ -44,7 +44,3 @@ Welcome to **Shadow Insurtech**, where cutting-edge cloud microservices and AI c
    Find each service in the [Shadow Insurtech GitHub organization](https://github.com/ShadowInsurtech).  
 2. **View API Docs**  
    Visit the [Shadow NCCI API Documentation](https://github.com/ShadowInsurtech/.github/blob/main/README.md) for detailed endpoints and examples.  
-3. **Deploy & Scale**  
-   All services are Terraform-managed and deploy seamlessly on Google Cloud Run.
-
-👉 **Ready to innovate insurance?** Explore our code, contribute, or spin up your own instance in minutes!
