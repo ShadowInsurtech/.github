@@ -1,0 +1,439 @@
+##############################################################################
+# Reusable Cloud Run deploy — build once, cache the deps layer, roll in place.
+#
+# WHAT IT IS
+#   The shared back half of every Cennairus back-end deploy: docker build+push
+#   to Artifact Registry, then terraform plan/apply against the pushed digest.
+#   Repos keep only the part that is actually theirs (service name, image name,
+#   terraform variables) and call this for the machinery.
+#
+# HOW TO CALL IT
+#   jobs:
+#     deploy:
+#       uses: ShadowInsurtech/.github/.github/workflows/_reusable-cloud-run.yml@main
+#       with:
+#         service_name: api-gateway-service-main
+#         image_name:   api-gateway-main
+#         ...
+#       secrets:
+#         GCP_SA_KEY:     ${{ secrets.GCP_SA_KEY }}
+#         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+#         TF_SECRET_VARS: |
+#           jwt_secret=${{ secrets.JWT_SECRET }}
+#
+#   This repo is PUBLIC, so any repo in the org — private ones included — can
+#   call it with no per-repo "Actions access" setting to flip. That is the
+#   reason it lives here and not in a private repo. Nothing secret may ever be
+#   written into this file; every credential arrives through `secrets:`.
+#
+# WHY IT IS SHAPED THIS WAY — the four things the old per-repo pipeline did
+# that cost minutes for nothing:
+#
+#   1. NO LAYER CACHE. `docker build` ran cold every time, so `npm install
+#      --include=dev` was re-run on every deploy even when only a .ts file
+#      changed. That single layer is the bulk of the 2m01s-2m14s "Build Docker
+#      image" step measured across api-gateway-main-rest, -delegated-graphql
+#      and policy-service. Fixed below with a BuildKit registry cache
+#      (`type=registry,mode=max`).
+#
+#      🔴 mode=max AND type=registry are both load-bearing. These Dockerfiles
+#      are multi-stage: `npm install` runs in the `builder` stage and only its
+#      RESULT (node_modules) is COPY'd into the final image. Inline cache
+#      (`--cache-from <image>:latest` + BUILDKIT_INLINE_CACHE=1) only carries
+#      metadata for layers that are IN the final image, so it can never restore
+#      a builder-stage step — measured, not assumed: with inline cache the
+#      `npm install` layer was rebuilt from scratch. Only a registry cache with
+#      mode=max exports intermediate stages. Do not "simplify" this back to
+#      inline cache.
+#
+#   2. `docker build --squash`. BuildKit accepts the flag and silently ignores
+#      it. It never shrank anything. Gone.
+#
+#   3. "Delete Old Docker Image from Artifact Registry", which ran
+#      `gcloud artifacts docker images delete <image>:<env> --delete-tags`
+#      BEFORE the build. Two problems: it deletes the previous image, so for
+#      the length of every deploy there was nothing left to roll back to; and
+#      it is the natural enemy of a layer cache — it would wipe the buildcache
+#      tag this workflow depends on. Gone. Prune by age/count with an Artifact
+#      Registry cleanup policy instead, never by blanket-deleting before a push.
+#
+#   4. "Esperar hasta que la imagen esté disponible", a loop that read the
+#      newest image in the registry into EXPECTED_SHA and then looped comparing
+#      the newest image in the registry to it — it compared a value with
+#      itself, so it could never fail for the reason it claimed to guard, while
+#      costing two registry listings per run (and up to 15 minutes of sleep if
+#      the listing was ever momentarily inconsistent). Replaced by the digest
+#      `docker buildx --push` itself reports, which is the actual proof the
+#      bytes landed.
+#
+# WHAT IT DELIBERATELY DOES NOT DO
+#   * No destroy-and-recreate. There is no "delete the Cloud Run service" and
+#     no "delete the terraform state" step. `terraform apply` rolls a NEW
+#     REVISION on the EXISTING service: zero downtime, VPC egress already warm.
+#     Recreating the service is what took prod down on 2026-06-28 (a brand-new
+#     service's first revision cannot reach MongoDB Atlas until its VPC egress
+#     is up, and Mongoose exits after its retries). Do not reintroduce it.
+#   * No change to WHAT ships. Same Dockerfile, same image contents, same
+#     terraform. Only the path from commit to revision got shorter.
+##############################################################################
+
+name: Reusable Cloud Run deploy
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: 'Cloud Run service name. Used for log lines and the job summary; terraform still owns the real name.'
+        required: true
+        type: string
+      image_name:
+        description: 'Image name inside the Artifact Registry repository, e.g. api-gateway-main.'
+        required: true
+        type: string
+      image_tag_prefix:
+        description: 'Environment prefix for the tags this run writes: <prefix>-<sha>, <prefix>-latest, <prefix>-buildcache.'
+        required: false
+        type: string
+        default: 'prod'
+      dockerfile:
+        description: 'Path to the Dockerfile, relative to the repo root.'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      build_context:
+        description: 'Docker build context.'
+        required: false
+        type: string
+        default: '.'
+      build_args:
+        description: 'Extra --build-arg values, one KEY=VALUE per line. For NON-SECRET values only — they are visible in the build log and baked into the image.'
+        required: false
+        type: string
+        default: ''
+      terraform_dir:
+        description: 'Directory holding the service terraform.'
+        required: false
+        type: string
+        default: './terraform'
+      terraform_image_var:
+        description: 'Name of the terraform variable that receives the image reference.'
+        required: false
+        type: string
+        default: 'api_gateway_image'
+      terraform_init_args:
+        description: 'Extra flags for terraform init, e.g. -backend-config="prefix=terraform/<svc>/dev" -reconfigure.'
+        required: false
+        type: string
+        default: ''
+      terraform_workspace:
+        description: 'Value for TF_WORKSPACE. Empty leaves the default workspace.'
+        required: false
+        type: string
+        default: ''
+      tf_vars:
+        description: 'NON-SECRET terraform variables, one name=value per line. Exported as TF_VAR_<name>.'
+        required: false
+        type: string
+        default: ''
+      registry:
+        description: 'Artifact Registry host.'
+        required: false
+        type: string
+        default: 'us-central1-docker.pkg.dev'
+      repository:
+        description: 'Artifact Registry repository.'
+        required: false
+        type: string
+        default: 'repoinsurtech'
+      environment:
+        description: 'GitHub Environment to run in (Production / QA). Empty for none.'
+        required: false
+        type: string
+        default: ''
+      runs_on:
+        description: 'Runner label.'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      announce_service:
+        description: 'Service name for the realtime-service release feed. Empty skips the announce entirely.'
+        required: false
+        type: string
+        default: ''
+      announce_env:
+        description: 'Environment label for the release feed (prod / dev).'
+        required: false
+        type: string
+        default: 'prod'
+      announce_dedupe_key:
+        description: 'dedupeKey for the release feed.'
+        required: false
+        type: string
+        default: ''
+      announce_url:
+        description: 'realtime-service /announce endpoint.'
+        required: false
+        type: string
+        default: 'https://realtime-service-716849480639.us-central1.run.app/announce'
+    secrets:
+      GCP_SA_KEY:
+        description: 'Service-account JSON for Artifact Registry + Cloud Run + the GCS terraform backend.'
+        required: true
+      GCP_PROJECT_ID:
+        description: 'GCP project id. Held as a secret in this org, which is why it never appears in a job output.'
+        required: true
+      TF_SECRET_VARS:
+        description: 'SECRET terraform variables, one name=value per line. Each value is masked and exported as TF_VAR_<name>.'
+        required: false
+    outputs:
+      image_digest:
+        description: 'Bare sha256:... digest of the image this run pushed. BARE ON PURPOSE — see the note on the push step.'
+        value: ${{ jobs.deploy.outputs.image_digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: ${{ inputs.service_name }}
+    runs-on: ${{ inputs.runs_on }}
+    environment: ${{ inputs.environment }}
+    outputs:
+      image_digest: ${{ steps.build.outputs.image_digest }}
+
+    env:
+      TF_IN_AUTOMATION: '1'
+      TF_INPUT: '0'
+      TF_WORKSPACE: ${{ inputs.terraform_workspace }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # Writes the gcloud credential helper into ~/.docker/config.json. buildx
+      # resolves registry credentials on the CLIENT and forwards a token to
+      # buildkit, so the docker-container builder created below authenticates
+      # through this too.
+      - name: Configure Docker for Artifact Registry
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: gcloud auth configure-docker "${REGISTRY}" --quiet
+
+      # 🔴 REQUIRED for `--cache-to type=registry`. The default `docker` buildx
+      # driver cannot export a registry cache at all — it accepts the flag and
+      # the export silently does nothing. Only the docker-container driver
+      # this action creates can.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+          REGISTRY: ${{ inputs.registry }}
+          REPOSITORY: ${{ inputs.repository }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          PREFIX: ${{ inputs.image_tag_prefix }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          BUILD_CONTEXT: ${{ inputs.build_context }}
+        run: |
+          set -euo pipefail
+          IMG="${REGISTRY}/${GCP_PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}"
+
+          ARGS=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            ARGS+=( --build-arg "$line" )
+          done <<< "$BUILD_ARGS"
+
+          # --cache-from is a miss, not an error, the first time this tag does
+          # not exist yet; buildx warns and builds cold.
+          #
+          # image-manifest=true + oci-mediatypes=true store the cache as an
+          # ordinary OCI image manifest. Artifact Registry rejects BuildKit's
+          # default cache manifest media type; these two flags are what make a
+          # registry cache work against GAR at all.
+          #
+          # --provenance=false keeps the push a single-arch image rather than
+          # an index with an attestation manifest, so the digest below is the
+          # image digest terraform pins and Cloud Run pulls.
+          # ${ARGS[@]+...} so an empty array is not an "unbound variable" under
+          # `set -u` on an older bash.
+          docker buildx build \
+            --file "${DOCKERFILE}" \
+            --cache-from "type=registry,ref=${IMG}:${PREFIX}-buildcache" \
+            --cache-to   "type=registry,ref=${IMG}:${PREFIX}-buildcache,mode=max,image-manifest=true,oci-mediatypes=true" \
+            --provenance=false \
+            --tag "${IMG}:${PREFIX}-${{ github.sha }}" \
+            --tag "${IMG}:${PREFIX}-latest" \
+            --metadata-file /tmp/build-metadata.json \
+            --push \
+            ${ARGS[@]+"${ARGS[@]}"} \
+            "${BUILD_CONTEXT}"
+
+          DIGEST=$(jq -r '."containerimage.digest"' /tmp/build-metadata.json)
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "buildx reported no image digest: '$DIGEST'" >&2; exit 1 ;;
+          esac
+
+          # 🔴 ONLY THE BARE sha256 CROSSES A JOB BOUNDARY. The full reference
+          # embeds ${GCP_PROJECT_ID}, which is a repository SECRET, and GitHub
+          # SILENTLY DROPS any job/workflow output whose value contains a
+          # secret — the consumer then receives an empty string and deploys
+          # nothing (front-end QA run 33805599296 shipped an empty image name
+          # exactly this way). Every consumer rebuilds the reference from its
+          # own copy of the secret.
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE_NAME}:${PREFIX}-${{ github.sha }} -> ${DIGEST}"
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # name=value lines -> TF_VAR_name. Values from TF_SECRET_VARS are
+      # ::add-mask::'d first: GitHub masks the multi-line secret as ONE string,
+      # so an individual line inside it would otherwise print in clear.
+      #
+      # Split on the FIRST '=' only, so values may contain '='. Values may not
+      # contain a newline (none of ours do — they are URLs, ids and tokens).
+      # Blank lines and '#' comment lines are skipped, so a caller can keep the
+      # operational notes that used to sit beside each `-var` flag. Leading
+      # whitespace is trimmed first, so an indented comment is still a comment.
+      # A TF_VAR_ for a variable the module does not declare is ignored by
+      # terraform without complaint, so a caller may pass a superset.
+      - name: Export terraform variables
+        env:
+          PLAIN_TF_VARS: ${{ inputs.tf_vars }}
+          SECRET_TF_VARS: ${{ secrets.TF_SECRET_VARS }}
+        run: |
+          set -euo pipefail
+          emit() {
+            local mask="$1" count=0 line name value delim
+            while IFS= read -r line; do
+              line="${line#"${line%%[![:space:]]*}"}"   # trim leading whitespace
+              [ -z "$line" ] && continue
+              case "$line" in \#*) continue ;; esac
+              case "$line" in *=*) ;; *) continue ;; esac
+              name="${line%%=*}"
+              value="${line#*=}"
+              name="$(printf '%s' "$name" | tr -d '[:space:]')"
+              [ -z "$name" ] && continue
+              if [ "$mask" = "mask" ] && [ -n "$value" ]; then
+                echo "::add-mask::${value}"
+              fi
+              delim="EOF_$(date +%s%N)_${RANDOM}"
+              {
+                echo "TF_VAR_${name}<<${delim}"
+                echo "${value}"
+                echo "${delim}"
+              } >> "$GITHUB_ENV"
+              count=$((count + 1))
+            done
+            echo "  exported ${count} variable(s)"
+          }
+          echo "non-secret:"; emit plain  <<< "${PLAIN_TF_VARS:-}"
+          echo "secret:";     emit mask   <<< "${SECRET_TF_VARS:-}"
+
+      # `terraform init` reaches the GCS backend, so it needs the GCP auth
+      # above. That is also true WITH `-backend=false` — the google provider
+      # is still configured and the plugin/backend resolution dials out — so
+      # never move a terraform step into a job that has no credentials.
+      #
+      # terraform_init_args arrives through the environment rather than being
+      # interpolated into the script body, and is deliberately left unquoted so
+      # it word-splits into separate flags. Write it WITHOUT shell quotes —
+      # `-backend-config=prefix=terraform/foo/dev`, not
+      # `-backend-config="prefix=..."` — or terraform receives the quote
+      # characters as part of the value.
+      - name: Initialize Terraform
+        env:
+          TF_INIT_ARGS: ${{ inputs.terraform_init_args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          terraform init -input=false ${TF_INIT_ARGS}
+        working-directory: ${{ inputs.terraform_dir }}
+
+      - name: Terraform format and validate
+        run: |
+          terraform fmt -check
+          terraform validate
+        working-directory: ${{ inputs.terraform_dir }}
+
+      - name: Terraform Plan
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
+          REGISTRY: ${{ inputs.registry }}
+          REPOSITORY: ${{ inputs.repository }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_VAR: ${{ inputs.terraform_image_var }}
+        run: |
+          set -euo pipefail
+          test -n "${IMAGE_DIGEST}" || { echo "No image digest from the build step" >&2; exit 1; }
+          IMG="${REGISTRY}/${GCP_PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}"
+          # Pinned by DIGEST, not by tag: the revision can then never drift onto
+          # a different image than the one this run built and proved pushed.
+          # Everything else reaches terraform as TF_VAR_* from the step above —
+          # which, unlike -var, ignores a variable the module does not declare,
+          # so a caller may safely pass a superset.
+          terraform plan -input=false -out=tfplan \
+            -var="${IMAGE_VAR}=${IMG}@${IMAGE_DIGEST}" \
+            -var="project_id=${GCP_PROJECT_ID}"
+        working-directory: ${{ inputs.terraform_dir }}
+
+      # In place. A new revision rolls in while the old one keeps serving.
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
+        working-directory: ${{ inputs.terraform_dir }}
+
+      - name: POST release to realtime-service
+        if: ${{ inputs.announce_service != '' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --prune --depth=100 origin "${GITHUB_REF}" || true
+          RANGE="${{ github.event.before }}..${{ github.sha }}"
+          COMMITS_TSV="$(git log --pretty=format:'%H%x09%s' "$RANGE" 2>/dev/null || true)"
+          if [ -z "$COMMITS_TSV" ]; then
+            COMMITS_TSV="$(git log -n 10 --pretty=format:'%H%x09%s' || true)"
+          fi
+          LISTS_JSON="$(printf '%s\n' "$COMMITS_TSV" \
+            | jq -R -s -c --arg repo "${GITHUB_REPOSITORY}" '
+                [ split("\n")[] | select(length>0) | split("\t") ] as $rows
+                | {
+                    commit: ($rows | map("https://github.com/" + $repo + "/commit/" + .[0])),
+                    notes:  ($rows | map(.[1]))
+                  }
+              ')"
+          jq -n \
+            --arg service "${{ inputs.announce_service }}" \
+            --arg env "${{ inputs.announce_env }}" \
+            --arg created_by "github-actions" \
+            --arg dedupeKey "${{ inputs.announce_dedupe_key }}" \
+            --argjson lists "$LISTS_JSON" \
+            '{ service: $service, env: $env, created_by: $created_by, dedupeKey: $dedupeKey } + $lists' \
+          | curl -fsS -H "Content-Type: application/json" -X POST "${{ inputs.announce_url }}" -d @-
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ inputs.service_name }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`${{ inputs.image_name }}:${{ inputs.image_tag_prefix }}-${{ github.sha }}\` |"
+            echo "| digest | \`${{ steps.build.outputs.image_digest }}\` |"
+            echo "| layer cache | \`${{ inputs.image_tag_prefix }}-buildcache\` (registry, mode=max) |"
+          } >> "$GITHUB_STEP_SUMMARY"
