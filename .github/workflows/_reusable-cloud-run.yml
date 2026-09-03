@@ -426,9 +426,56 @@ jobs:
         with:
           terraform_wrapper: false
 
-      # name=value lines -> TF_VAR_name. Values from TF_SECRET_VARS are
-      # ::add-mask::'d first: GitHub masks the multi-line secret as ONE string,
-      # so an individual line inside it would otherwise print in clear.
+      # name=value lines -> a generated `zzz-ci.auto.tfvars.json` in the
+      # terraform dir, AND TF_VAR_name in the environment. Values from
+      # TF_SECRET_VARS are ::add-mask::'d first: GitHub masks the multi-line
+      # secret as ONE string, so an individual line inside it would otherwise
+      # print in clear.
+      #
+      # 🔴 WHY A GENERATED .auto.tfvars.json AND NOT JUST TF_VAR_*.
+      # TF_VAR_* is the LOWEST-precedence way to set a terraform variable:
+      #
+      #   TF_VAR_*  <  terraform.tfvars  <  *.auto.tfvars(.json)  <  -var
+      #
+      # The per-repo workflows this replaces passed every value with `-var`,
+      # the HIGHEST precedence — so in any repo that also has a checked-in
+      # `terraform.tfvars`, exporting TF_VAR_ alone would silently hand the
+      # decision back to the committed literal. Measured, not assumed: with
+      # `foo = "FROM_TFVARS"` in terraform.tfvars, `TF_VAR_foo=FROM_ENV
+      # terraform plan` resolves foo to FROM_TFVARS.
+      #
+      # That is not academic. Cron-service's terraform.tfvars pins
+      # `service_name = "cron-service"` while its QA workflow overrides it to
+      # `cron-service-dev`; Microservice-email's pins the Mailgun key and three
+      # Mongo URIs that its workflow overrides from secrets. Losing those
+      # overrides would deploy QA under the prod service name and ship stale
+      # credentials.
+      #
+      # `*.auto.tfvars.json` is auto-loaded, outranks terraform.tfvars, and is
+      # still outranked by the `-var` flags the plan step uses for the image
+      # and project_id — so precedence now matches the old `-var` behaviour for
+      # every caller. JSON rather than HCL on purpose: `terraform fmt -check`
+      # (run below) inspects .tf and .tfvars but NOT .tfvars.json, so the
+      # generated file cannot fail the format gate. The `zzz-` prefix makes it
+      # sort last among auto-loaded files, so a repo's own *.auto.tfvars would
+      # still lose to the caller, as with -var.
+      #
+      # Undeclared variables stay harmless: a value for a variable the module
+      # does not declare is a WARNING from a .tfvars file, not an error, so a
+      # caller may still pass a superset. Repos with no .tfvars file at all
+      # (api-gateway-main-rest among them) are unaffected either way.
+      #
+      # ⚠️ ONE LIMIT. Every value is written as a JSON STRING, because that is
+      # what a `name=value` line is. Terraform converts a string to the target
+      # type for `bool` and `number` variables ("true" -> true, "42" -> 42,
+      # verified), so those are fine — but it CANNOT convert a string to a
+      # `list`/`set`/`map`/`object`, and such a variable fails the plan with
+      # "Invalid value for input variable". Loud, immediate, and not silent.
+      # A caller needing a collection-typed variable should set it in the
+      # repo's own terraform, not through tf_vars/TF_SECRET_VARS.
+      #
+      # TF_VAR_* is still exported alongside, so nothing that read it before
+      # stops working.
       #
       # Split on the FIRST '=' only, so values may contain '='. Values may not
       # contain a newline (none of ours do — they are URLs, ids and tokens).
@@ -441,8 +488,10 @@ jobs:
         env:
           PLAIN_TF_VARS: ${{ inputs.tf_vars }}
           SECRET_TF_VARS: ${{ secrets.TF_SECRET_VARS }}
+          TF_DIR: ${{ inputs.terraform_dir }}
         run: |
           set -euo pipefail
+          PAIRS="$(mktemp)"
           emit() {
             local mask="$1" count=0 line name value delim
             while IFS= read -r line; do
@@ -463,12 +512,27 @@ jobs:
                 echo "${value}"
                 echo "${delim}"
               } >> "$GITHUB_ENV"
+              # Tab-separated so the JSON below can split on the FIRST tab and
+              # keep any '=' or quote in the value intact. Names are already
+              # whitespace-stripped, so they can never contain a tab.
+              printf '%s\t%s\n' "${name}" "${value}" >> "$PAIRS"
               count=$((count + 1))
             done
             echo "  exported ${count} variable(s)"
           }
           echo "non-secret:"; emit plain  <<< "${PLAIN_TF_VARS:-}"
           echo "secret:";     emit mask   <<< "${SECRET_TF_VARS:-}"
+
+          # Written LAST so a duplicated name resolves the same way the
+          # environment does: the secret list is emitted after the plain one,
+          # and `add` keeps the later value.
+          AUTO_TFVARS="${TF_DIR%/}/zzz-ci.auto.tfvars.json"
+          jq -Rn '[inputs | capture("^(?<k>[^\t]*)\t(?<v>.*)$") | {(.k): .v}] | add // {}' \
+            < "$PAIRS" > "$AUTO_TFVARS"
+          rm -f "$PAIRS"
+          # Names only. NEVER print the file: it holds every secret value.
+          echo "wrote $(jq -r 'keys | length' < "$AUTO_TFVARS") variable(s) to ${AUTO_TFVARS}:"
+          jq -r 'keys[] | "  " + .' < "$AUTO_TFVARS"
 
       # `terraform init` reaches the GCS backend, so it needs the GCP auth
       # above. That is also true WITH `-backend=false` — the google provider
