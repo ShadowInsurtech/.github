@@ -20,6 +20,9 @@
 #         GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
 #         TF_SECRET_VARS: |
 #           jwt_secret=${{ secrets.JWT_SECRET }}
+#         # A --build-arg whose value is a secret (masked in the log):
+#         BUILD_ARGS_SECRET: |
+#           NEXT_PUBLIC_MAPS_KEY=${{ secrets.NEXT_PUBLIC_MAPS_KEY }}
 #         # Only when the Dockerfile has `RUN --mount=type=secret,id=<id>`:
 #         BUILD_SECRETS: |
 #           npmrc<<NPMRC_EOF
@@ -191,6 +194,22 @@ on:
       TF_SECRET_VARS:
         description: 'SECRET terraform variables, one name=value per line. Each value is masked and exported as TF_VAR_<name>.'
         required: false
+      BUILD_ARGS_SECRET:
+        description: >-
+          SECRET `--build-arg` values, one KEY=VALUE per line, appended to the
+          non-secret `build_args` input. Each value is ::add-mask::ed before
+          the build runs, so it stays hidden in the log — including in the
+          `ENV`/`ARG` step lines BuildKit prints. Use it for a build arg whose
+          value comes from a GitHub secret; use the plain `build_args` input
+          for literals. It is a SECRET rather than part of that input because
+          workflow_call INPUTS are not masked by GitHub, so a value passed
+          there would print in clear in the called workflow's log.
+          🔴 A --build-arg is still BAKED INTO THE IMAGE and readable by anyone
+          who can pull it (`docker history`). This masks the LOG, not the
+          image. NEXT_PUBLIC_* values are public by construction and fine;
+          anything that must not ship inside the image belongs in
+          BUILD_SECRETS instead, which mounts and never persists.
+        required: false
       BUILD_SECRETS:
         description: >-
           BuildKit build secrets, mounted into the build as
@@ -262,18 +281,33 @@ jobs:
           PREFIX: ${{ inputs.image_tag_prefix }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           BUILD_CONTEXT: ${{ inputs.build_context }}
+          BUILD_ARGS_SECRET: ${{ secrets.BUILD_ARGS_SECRET }}
           BUILD_SECRETS: ${{ secrets.BUILD_SECRETS }}
         run: |
           set -euo pipefail
           IMG="${REGISTRY}/${GCP_PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}"
 
+          # Non-secret build args first, then the secret ones. Same KEY=VALUE
+          # shape; the only difference is that a secret value is ::add-mask::ed
+          # before it can reach the log. GitHub masks a multi-line secret as
+          # ONE string, so an individual line out of it would otherwise print
+          # in clear — including in the `ENV`/`ARG` step lines BuildKit prints.
           ARGS=()
-          while IFS= read -r line; do
-            line="${line#"${line%%[![:space:]]*}"}"
-            [ -z "$line" ] && continue
-            case "$line" in \#*) continue ;; esac
-            ARGS+=( --build-arg "$line" )
-          done <<< "$BUILD_ARGS"
+          collect_args() {
+            local mask="$1" line value
+            while IFS= read -r line; do
+              line="${line#"${line%%[![:space:]]*}"}"
+              [ -z "$line" ] && continue
+              case "$line" in \#*) continue ;; esac
+              if [ "$mask" = mask ]; then
+                case "$line" in *=*) value="${line#*=}" ;; *) value="" ;; esac
+                [ -n "$value" ] && echo "::add-mask::${value}"
+              fi
+              ARGS+=( --build-arg "$line" )
+            done
+          }
+          collect_args plain <<< "$BUILD_ARGS"
+          collect_args mask  <<< "${BUILD_ARGS_SECRET:-}"
 
           # ── BuildKit build secrets ──────────────────────────────────────
           # For Dockerfiles carrying `RUN --mount=type=secret,id=<id>` — a
